@@ -766,11 +766,6 @@ class InworldTTSService(WebsocketTTSService):
         # Track the end time of the last word in the current generation
         self._generation_end_time = 0.0
 
-        # Context IDs already sent to the server via _send_context, used to
-        # make _send_context idempotent so on_turn_context_created can eagerly
-        # open contexts without causing duplicate creates in run_tts.
-        self._sent_context_ids: set[str] = set()
-
         # Fallback tracking for when timestamps are not received. Without
         # timestamps, interruptions commit the full text rather than only the
         # portion that was spoken.
@@ -838,23 +833,15 @@ class InworldTTSService(WebsocketTTSService):
         flush_id = context_id or self.get_active_audio_context_id()
         if flush_id and self._websocket:
             logger.trace(f"Flushing audio for context {flush_id}")
-            await self._send_flush(flush_id)
+            try:
+                await self._send_flush(flush_id)
+            except Exception as e:
+                await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
 
     def _reset_generation_timing(self):
         """Reset the cumulative time and generation end time for a new generation."""
         self._cumulative_time = 0.0
         self._generation_end_time = 0.0
-
-    async def on_turn_context_created(self, context_id: str):
-        """Eagerly open the context on the server when a new turn starts.
-
-        This overlaps server-side context creation with sentence aggregation
-        time, so the context is ready by the time text arrives in run_tts.
-        """
-        try:
-            await self._send_context(context_id)
-        except Exception as e:
-            logger.warning(f"{self}: Failed to pre-open context: {e}")
 
     def _calculate_word_times(self, timestamp_info: dict[str, Any]) -> list[tuple[str, float]]:
         """Calculate word timestamps from Inworld WebSocket API response.
@@ -903,7 +890,6 @@ class InworldTTSService(WebsocketTTSService):
                 await self._send_close_context(context_id)
             except Exception as e:
                 await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
-        self._sent_context_ids.discard(context_id)
 
     async def on_turn_context_completed(self):
         """Close the server-side context at end of turn.
@@ -912,8 +898,10 @@ class InworldTTSService(WebsocketTTSService):
         last audio byte.
         """
         ctx_id = self._turn_context_id
+        opened = ctx_id is not None and self.audio_context_available(ctx_id)
         await super().on_turn_context_completed()
-        await self._close_context(ctx_id)
+        if opened:
+            await self._close_context(ctx_id)
 
     async def on_audio_context_interrupted(self, context_id: str):
         """Callback invoked when an audio context has been interrupted."""
@@ -953,6 +941,11 @@ class InworldTTSService(WebsocketTTSService):
             return self._websocket
         raise Exception("Websocket not connected")
 
+    @property
+    def _receive_loop_running(self) -> bool:
+        """Whether the receive loop is running, and so owns reconnecting."""
+        return self._receive_task is not None and not self._receive_task.done()
+
     async def _connect(self):
         """Connect to the Inworld WebSocket TTS service.
 
@@ -963,7 +956,7 @@ class InworldTTSService(WebsocketTTSService):
 
         await self._connect_websocket()
 
-        if self._websocket and not self._receive_task:
+        if self._websocket and not self._receive_loop_running:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
         if self._websocket:
@@ -1035,17 +1028,18 @@ class InworldTTSService(WebsocketTTSService):
 
             if self._websocket:
                 logger.debug("Disconnecting from Inworld WebSocket TTS")
-                audio_contexts = self.get_audio_contexts()
-                if audio_contexts:
-                    for ctx_id in audio_contexts:
+                try:
+                    for ctx_id in self.get_audio_contexts():
                         await self._send_close_context(ctx_id)
+                except Exception as e:
+                    # The connection is already gone; it still needs closing.
+                    logger.debug(f"{self}: unable to close contexts before disconnecting: {e}")
                 await self._websocket.close()
                 logger.debug("Disconnected from Inworld WebSocket TTS")
         except Exception as e:
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
             self._websocket = None
-            self._sent_context_ids.clear()
             self._reset_generation_timing()
             self._context_texts.clear()
             self._contexts_with_timestamps.clear()
@@ -1160,16 +1154,9 @@ class InworldTTSService(WebsocketTTSService):
     async def _send_context(self, context_id: str):
         """Send a context to the Inworld WebSocket TTS service.
 
-        Idempotent: skips the send if this context was already opened on the
-        server (e.g., eagerly via on_turn_context_created).
-
         Args:
             context_id: The context ID.
         """
-        if context_id in self._sent_context_ids:
-            return
-        self._sent_context_ids.add(context_id)
-
         audio_config = {
             "audioEncoding": self._audio_encoding,
             "sampleRateHertz": self._audio_sample_rate,
@@ -1205,7 +1192,7 @@ class InworldTTSService(WebsocketTTSService):
 
         msg = {"create": create_config, "contextId": context_id}
         logger.trace(f"{self}: Sending context create: {create_config}")
-        await self.send_with_retry(json.dumps(msg), self._report_error)
+        await self._get_websocket().send(json.dumps(msg))
 
     async def _send_text(self, context_id: str, text: str):
         """Send text to the Inworld WebSocket TTS service.
@@ -1215,7 +1202,7 @@ class InworldTTSService(WebsocketTTSService):
             text: The text to send.
         """
         msg = {"send_text": {"text": text}, "contextId": context_id}
-        await self.send_with_retry(json.dumps(msg), self._report_error)
+        await self._get_websocket().send(json.dumps(msg))
 
     async def _send_flush(self, context_id: str):
         """Send a flush to the Inworld WebSocket TTS service.
@@ -1224,7 +1211,7 @@ class InworldTTSService(WebsocketTTSService):
             context_id: The context ID.
         """
         msg = {"flush_context": {}, "contextId": context_id}
-        await self.send_with_retry(json.dumps(msg), self._report_error)
+        await self._get_websocket().send(json.dumps(msg))
 
     async def _send_close_context(self, context_id: str):
         """Send a close context to the Inworld WebSocket TTS service.
@@ -1233,7 +1220,7 @@ class InworldTTSService(WebsocketTTSService):
             context_id: The context ID.
         """
         msg = {"close_context": {}, "contextId": context_id}
-        await self.send_with_retry(json.dumps(msg), self._report_error)
+        await self._get_websocket().send(json.dumps(msg))
 
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
@@ -1249,7 +1236,14 @@ class InworldTTSService(WebsocketTTSService):
         logger.debug(f"{self}: Generating WebSocket TTS [{text}, for context: {context_id}]")
 
         try:
-            if not self._websocket or self._websocket.state is State.CLOSED:
+            if not self._websocket or self._websocket.state is not State.OPEN:
+                if self._receive_loop_running:
+                    # The receive loop reconnects. A connection opened here
+                    # would race it, leaving this turn's audio on a connection
+                    # nothing reads. Pushed rather than yielded: this turn has
+                    # no audio context to carry the error.
+                    await self.push_error(error_msg=f"{self}: websocket reconnecting, skipping TTS")
+                    return
                 await self._connect()
 
             if self._websocket is None:
